@@ -152,14 +152,24 @@ failures than Flash-Next).
 
 ## Known limitations (not yet fixed)
 
-- **`--enforce-eager` is required** — an unrelated Triton/Inductor
-  autotuning failure with graphs enabled; not root-caused here. This is the
-  single largest remaining lever: HIP/CUDA graph capture is primarily a
-  *decode*-speed optimization (collapses per-step kernel-launch overhead),
-  and MoE architectures like this one issue *more* small kernel launches
-  per layer than a dense model (routing, per-expert dispatch), so it may
-  matter more here than average — untested until the underlying bug is
-  found.
+- **`--enforce-eager` is required — root cause now understood, fix not yet found.**
+  `torch.compile`/Inductor tracing actually succeeds cleanly (QSA is already
+  correctly excluded from it via the same `no_compile_layers` opaque-custom-op
+  pattern used for the PLE gather). The real failure is one phase later, during
+  CUDA/HIP **graph capture**: QSA's Triton attention kernels
+  (`amd/ops/qsa.py`) run autotuning that explores multiple candidate kernel
+  configs, some invalid for gfx1201's WMMA v2 ISA — normally harmless (Triton
+  silently discards failed candidates), but fatal when it happens on a stream
+  that's actively being graph-captured (`hipErrorStreamCaptureUnsupported`).
+  This is why eager mode works fine (autotuning never runs inside a capturing
+  stream) despite hitting the identical kernels.
+  Tried: `--compilation-config '{"cudagraph_mode":"NONE"}'` (disables graph
+  capture, keeps Inductor fusion) — **loads and serves successfully, but is
+  slightly slower than `--enforce-eager`** (4.8–5.7 tok/s vs. 6.7–6.8 tok/s),
+  so not adopted. The real fix is pre-warming QSA's Triton kernels in eager
+  mode *before* graph capture begins, so the autotuning search resolves and
+  caches before any stream starts capturing — not yet implemented. Full
+  investigation: `GRAPH-CAPTURE-FIX.md`.
 - **AITER untried** — `VLLM_ROCM_USE_AITER=1` is validated elsewhere on
   this hardware, but historically needs FP8 KV to avoid a separate LDS-
   overflow crash, which conflicts with this architecture's mandatory BF16
