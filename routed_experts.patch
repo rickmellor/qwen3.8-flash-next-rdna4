@@ -1,0 +1,42 @@
+--- /home/rick/scratch/flashnext/routed_experts.orig.py	2026-09-03 11:22:03.353534699 -0700
++++ /home/rick/scratch/flashnext/routed_experts.py	2026-09-03 12:34:06.443838103 -0700
+@@ -918,6 +918,39 @@
+                 if param is None:
+                     if param_name.endswith(("w13_bias", "w2_bias")):
+                         continue
++                    # Quantized-MoE checkpoints (e.g. AWQ WNA16 fallback,
++                    # gfx1201) register w13_qweight/w2_qweight (+ _qzeros/
++                    # _scales), not w13_weight/w2_weight -- those bare names
++                    # only exist as post-load aliases created in
++                    # process_weights_after_loading, too late for this loop.
++                    # A checkpoint tensor that resolves to a bare "_weight"
++                    # param_name here is a spurious synthetic 4th tensor (see
++                    # long comment above the raise for the full story,
++                    # confirmed via live instrumentation 2026-09-03): the
++                    # real data for this expert/shard already arrived via the
++                    # qweight/qzeros/scales tensors, which correctly resolve
++                    # via this same mapping (their suffix survives the
++                    # qual_name substitution). Skip it rather than redirect
++                    # it into the real qweight param -- redirecting silently
++                    # overwrites correctly-loaded weights with garbage.
++                    if "_weight" in param_name:
++                        base = param_name.split("_weight", 1)[0]
++                        if getattr(self, base + "_qweight", None) is not None:
++                            # This param_name (e.g. w2_weight, w2_weight_scale_inv)
++                            # has no real registered attribute under the
++                            # MoeWNA16 fallback -- but the real AWQ qweight
++                            # sibling for this shard DOES exist, meaning this
++                            # logical expert/shard is already correctly
++                            # quantized+loaded via the real qweight/qzeros/
++                            # scales tensors. Whatever spurious/vestigial
++                            # tensor produced this match (confirmed live
++                            # 2026-09-03: both a bare "...down_proj.weight"
++                            # and a "...down_proj.weight_scale_inv" have been
++                            # observed for this checkpoint/arch/quant-method
++                            # combo -- an FP8-style scale-inverse tensor that
++                            # AWQ int4 (weight_bits=4) doesn't use) is safe to
++                            # skip rather than error or misroute.
++                            continue
+                     raise AttributeError(
+                         f"Layer {self.layer_name} has no parameter {param_name!r} "
+                         f"for checkpoint weight {qual_name!r}"

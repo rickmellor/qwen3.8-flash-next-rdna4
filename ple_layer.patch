@@ -1,0 +1,32 @@
+--- /home/rick/scratch/flashnext/ple_layer.orig.py	2026-09-03 11:01:25.511506346 -0700
++++ /home/rick/scratch/flashnext/ple_layer.py	2026-09-03 11:02:05.143120328 -0700
+@@ -3,6 +3,7 @@
+ """GPU-resident Qwen4Exp position-learning enhancement layers."""
+ 
+ import math
++import os
+ from collections.abc import Iterable, Sequence
+ 
+ import torch
+@@ -31,6 +32,9 @@
+ from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
+ 
+ from ..common.ple import PLEVocabParallelEmbedding
++from ..common.ple_cpu import PLECpuOffloadEmbedding
++
++_PLE_CPU_OFFLOAD = os.environ.get("VLLM_QWEN4EXP_PLE_CPU_OFFLOAD", "0") == "1"
+ 
+ 
+ class Qwen4ExpPLEGroupedNorm(nn.Module):
+@@ -224,7 +228,10 @@
+         )
+         divisor = int(config.make_ngram_vocab_size_divisible_by)
+         padded_vocab_size = ((total_vocab_size + divisor - 1) // divisor) * divisor
+-        self.ngram_embedding = PLEVocabParallelEmbedding(
++        _ple_embedding_cls = (
++            PLECpuOffloadEmbedding if _PLE_CPU_OFFLOAD else PLEVocabParallelEmbedding
++        )
++        self.ngram_embedding = _ple_embedding_cls(
+             padded_vocab_size,
+             self.head_dim,
+             padding_size=divisor,
