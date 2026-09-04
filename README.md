@@ -34,7 +34,7 @@ the production EP seat is in progress as of this writing — see Validation.
 - Checkpoint: [`leoncca/Qwen3.8-Flash-Next-AWQ-g32`](https://huggingface.co/leoncca/Qwen3.8-Flash-Next-AWQ-g32)
   (expert-only AWQ W4A16, group size 32; 129 GB on disk)
 
-## The four problems, and the fixes
+## The five problems, and the fixes
 
 ### 1. PLE embedding table doesn't fit in VRAM (`ple_cpu.py`, new file)
 
@@ -125,6 +125,32 @@ Why you want EP on this model: TP8 is impossible for the AWQ-g32 checkpoint (the
 640-wide experts shard to 80 columns per rank on the down-projection and
 80 % 32 ≠ 0), so expert parallelism is the only way to spread this model across
 8 GPUs — and it is also faster on 4 (see Validation).
+
+### 5. Mixed-length concurrent prefills OOM in the PLE short-conv (`ple_layer.py`, second hunk)
+
+Found 2026-09-04 by the first full bench suite: AutomationBench put four ~16K-token
+prompts into prefill together and TP rank 1 died with
+`torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 290.00 MiB … 0 bytes free`
+inside `_short_conv_dilated_prefill_batched` (`packed_tokens.transpose(1, 2).contiguous()`).
+The engine core then hangs forever on the dead worker while `/health` keeps answering 200.
+
+Cause (upstream vLLM code, not one of the RDNA4 patches): the batched prefill pads every
+in-flight request to the longest one and materialises ~5 copies of that padded block
+(packed, its transpose, `history`, the conv output and its transpose). vLLM's startup
+memory profile sizes its batch as `max_num_seqs` *equal-length* chunks, so it never sees
+the padded case. With `gpu_memory_utilization=0.95` the KV cache takes every byte the
+profile left (peak activation 2.11 GiB), so a real batch of one long chunk plus a few
+short prompts overruns it. Any tight-gmu seat would hit this; it is not RDNA4-specific.
+
+Fix (`ple_layer.patch`, second hunk): when padding would exceed ~25 % of the real prefill
+tokens, run the requests one at a time through the same packed math
+(`_short_conv_dilated_prefill_per_request` → `_short_conv_dilated_prefill_core`). Each
+request then costs at most one full-width chunk, which the profile does cover. Even-length
+batches keep the packed, sync-free path; the fallback does one small device-to-host sync
+for the lengths and is eager-only (prefill is never graph-captured). Verified bit-exact
+against the packed path on CPU (outputs and conv-state write-back), and live on the
+0.95 seat: `1×16K+3×short`, `4×16K`, `1×32K+3×2K`, `4×32K` concurrent prefills, no OOM
+(`tools/stress_prefill.py`). Candidate for upstreaming.
 
 ## Applying the patches
 
@@ -271,10 +297,31 @@ degrading quality for speed.
 PIECEWISE config (2026-09-03, TP4, no MTP, SHM env): 95.12 % @c1 · 95.73 % @c2 ·
 93.90 % @c8 — numerical drift, see "Graph capture" above and `GRAPH-CAPTURE-FIX.md`.
 
-**Production (EP + PIECEWISE + MTP) quality is pending.** As of 2026-09-04 only the
-arithmetic sanity check has run on it; a full suite (HumanEval, ARC, needle, PlanBench,
-AutomationBench, …) is running against the production seat and the results will be
-recorded here. Until then: speed-validated, quality-pending.
+**Production config (EP + PIECEWISE + MTP k=2, gmu 0.95, mml 131072, seqs 4), full suite
+2026-09-04** — `johnny bench flashnext-awq-tp4-ep-p2p-piecewise-mtp-mml131072`, thinking
+off, concurrency 4 unless noted, run on the live boot-profile seat:
+
+| Suite | Flash-Next EP (prod) | Reference on the same box |
+|---|---|---|
+| HumanEval pass@1 | **95.73 %** (157/164) | 96.34 % eager (this model); 27B-FP8 93.29–96.34 %; gemma-4-26B 95.12–96.34 % |
+| ARC-Challenge (first 400, CoT, 2048-tok budget) | **97.0 %** (388/400, 1 no-extraction) | gemma 93.75 %, Nemotron-3-Super 91.5 %, Qwen-122B 87.0 %, 27B 79–80 % — all at the old 512-tok budget |
+| PlanBench task_1 exact plan (100) | **89.0 %** (prefix 89.2 %, 0 errors) | 27B 57 %, gemma 34 % |
+| AutomationBench (30 tasks, 6 domains) | **40.0 %** pass, 66.8 % avg partial | 27B effort-low TP4 40.0 % / 61.2 %; gemma 6.7 % / 13.6 % |
+| Code needle (16 targets, 30K corpus) | 15/16 | 15/16 for 27B and gemma |
+| ICL pattern probe (16) | 1/16 | 0/16 for every other model here |
+| Depth (llama-benchy, pp 2048 / tg 32) | 48.6 / 47.0 / 41.3 tok/s decode at 0 / 4K / 8K depth; ~1.5–1.6K tok/s prefill | — |
+| Perf (bench.sh, 100-tok bursts) | 40.4 tok/s single · **120.0 tok/s** aggregate @c4 | fleet-comparable numbers; the 512-token single-stream figure is ~49 |
+| ctxsafe (real needle requests at rising depth, disposable seat, live VRAM poll) | **verified safe to 131,072** (the full max_model_len; 2 trials at 124.5K and 131K), no crash, VRAM peak 31.7 GB | 27B-FP8 262K, Nemotron 123K (limited) |
+
+The seven HumanEval failures are the eager run's six plus `minPath` — the PIECEWISE
+numerical-drift signature, not a new failure mode. ARC's one miss rambled to the 2048
+cap. The first ARC pass at the harness's old 512-token budget scored 87.75 % with 41
+truncated answers; the budget was raised for both modes afterwards (johnny `0e87c3d`),
+so the reference models' ARC numbers above will rise when re-run.
+
+The suite also found and fixed problem 5 (mixed-length concurrent prefills OOM the PLE
+short-conv — AutomationBench crashed the seat on its first attempt, then passed cleanly
+on the patched file).
 
 For reference, on the same hardware and methodology: a dense Qwen3.8-27B-FP8
 scores 93.29% (153/164); Gemma-4-26B scores 96.34% (158/164, different 6
@@ -298,6 +345,12 @@ failures than Flash-Next).
 - **No RDNA4-specific kernel tuning applied** — precedent on this hardware
   shows ~0% gain from this class of tuning on MoE architectures specifically
   (vs. +2–4% on dense models), so it's a low priority.
+- **The KV pool varies ~20 % between launches of the identical config** — 271,558 tokens
+  (hand launch), 250,557 and 220,867 (johnny launches, same image/knobs, 2026-09-04).
+  Weights and profiled peak activation are identical each time; what moves is the
+  "consumed (weights + non-torch)" figure vLLM measures after load (24.49 → 24.51 → 24.94
+  GiB per GPU), i.e. HIP/RCCL/kernel-cache residency. Harmless for a personal seat (still
+  ≥ 1.69× of 131K) but worth knowing before promising a concurrency number. Unexplained.
 - **`moe_wna16.patch` is not upstreamed yet.** It is a plain vLLM bug for any WNA16 MoE
   under EP.
 - All patched files were built and validated against the exact vLLM commit
