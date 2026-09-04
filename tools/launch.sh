@@ -3,9 +3,10 @@
 #
 #   MODEL_DIR=/path/to/Qwen3.8-Flash-Next-AWQ-g32 tools/launch.sh [name] [port] [gpus]
 #
-# Knobs (env):  GMU (0.95)  MML (131072)  SEQS (4)  EP (0|1, default 0)  MTP (2; 0 = off)
+# Knobs (env):  GMU (0.95)  MML (131072)  SEQS (4)  EP (1 = expert parallel, default; 0 = TP only)  MTP (2; 0 = off)
 #               LADDER (json list; default tools/compilation_config_seqs4.json's)
 #               IMAGE (the Sept-2 2026 nightly)  VLLM_CACHE (host dir for the torch.compile cache)
+# Defaults are the validated production config (README § Status): TP4 + EP, PIECEWISE graphs + MTP(2), P2P env.
 # The env below is the P2P env: HSA_ENABLE_IPC_MODE_LEGACY=0 (NOT NCCL_P2P_DISABLE/RCCL_NET) — see TUNING.md.
 set -euo pipefail
 REPO=$(cd "$(dirname "$0")/.." && pwd)
@@ -13,7 +14,7 @@ NAME=${1:-flashnext}; PORT=${2:-8011}; GPUS=${3:-0,1,2,3}
 : "${MODEL_DIR:?set MODEL_DIR to the checkpoint directory}"
 IMAGE=${IMAGE:-vllm/vllm-openai-rocm:nightly-27a94d1ce4e3fc100c4732439ccec10f8246a804}
 V=/usr/local/lib/python3.12/dist-packages/vllm
-GMU=${GMU:-0.95}; MML=${MML:-131072}; SEQS=${SEQS:-4}; EP=${EP:-0}; MTP=${MTP:-2}
+GMU=${GMU:-0.95}; MML=${MML:-131072}; SEQS=${SEQS:-4}; EP=${EP:-1}; MTP=${MTP:-2}
 CC=$(python3 - "$REPO" "${LADDER:-}" <<'PY'
 import json,sys
 cc=json.load(open(f"{sys.argv[1]}/tools/compilation_config_seqs4.json"))

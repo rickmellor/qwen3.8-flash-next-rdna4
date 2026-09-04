@@ -1,5 +1,13 @@
 # Investigating the `--enforce-eager` requirement (Inductor/CUDA-graph bug)
 
+> **Status 2026-09-04 — superseded.** This is the investigation log, kept verbatim. Its
+> conclusion moved after it was written: PIECEWISE graph capture (with the QSA kernel warmup
+> and the extra `splitting_ops` entry described below) **is the production configuration**,
+> and `--enforce-eager` is retired. The final section's verdict — the HumanEval movement is
+> numerical drift at the graph-split boundaries, not a logic bug — is what made that call;
+> every "stay on `--enforce-eager`" recommendation in the sections before it is historical.
+> Current config and numbers: `README.md`; how the rest of the seat was tuned: `TUNING.md`.
+
 ## Root cause: found, with real evidence (not the same bug reported earlier)
 
 The original report (`AWQ-MOE-LOADER-FIX-v3.md`) hit `torch._inductor.exc.InductorError:

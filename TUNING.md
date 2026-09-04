@@ -17,6 +17,7 @@ Tooling referenced here lives in `tools/`.
 | Memory budget | 24.5 GiB/GPU is weights; KV is the residual. ~62.7K tokens per GiB per GPU. |
 | Knobs that matter | `--gpu-memory-utilization 0.95` (0.97 OOMs under batching), `--max-num-seqs 4` (2 crashes compile), an explicit `cudagraph_capture_sizes` ladder, `--max-model-len 131072` → 272K-token pool, 2.08× |
 | Expert parallelism | Works after a 4th patch (`moe_wna16.py`); **+8–10 % decode** on 4 GPUs; the only way to 8 GPUs with this AWQ-g32 checkpoint. |
+| Graph capture | PIECEWISE + the QSA kernel warmup is the production mode; `--enforce-eager` retired 2026-09-04 (README, `GRAPH-CAPTURE-FIX.md`). |
 | Best config so far | TP4 + EP, PIECEWISE + MTP(2), P2P env: **49.4 ± 3.2 tok/s @ 55K, 48.3 ± 3.3 @ 120K**, single stream. |
 
 ---
@@ -119,7 +120,7 @@ temperature-0, prefix-cached requests. Several apparent "findings" evaporated on
 
 ---
 
-## 3. Memory budget (TP4, `--cpu-offload-gb 10`, PLE on host RAM)
+## 3. Memory budget (TP4, PLE table on host RAM via `ple_cpu.py`, no `--cpu-offload-gb`)
 
 Per GPU at gmu 0.93, seqs 4, default capture ladder, mml 65536 (the earlier config):
 
@@ -141,7 +142,7 @@ Levers, with what happened when each was pulled:
 | `--max-num-seqs 2` | Fails the first `torch.compile` pass: `ConstraintViolationError (L['query_start_loc'].size()[0])`. Use 4. |
 | explicit `cudagraph_capture_sizes` | The default ladder scales with `max_num_seqs × (MTP+1)`: at seqs 32 it went to **192 sizes and left 0 GiB for KV**. `[1,2,3,4,6,8,12]` for seqs 4 (graph memory 1.11 → 0.9 GiB); `[1,2,4,8,12,16,24,32,48,64,96]` for seqs 32. Files: `tools/compilation_config_seqs{4,32}.json`. |
 | `--kv-cache-dtype fp8` | Impossible: the QSA attention raises `NotImplementedError`. BF16 KV is mandatory. |
-| more `--cpu-offload-gb` | Untested. Each extra GiB/GPU ≈ +63K tokens, but streams more weights per token; expected to hurt decode. |
+| `--cpu-offload-gb` (generic weight offload) | Not used anywhere in this repo's configs — the PLE offload patch is what makes the model fit. Untested as a KV-headroom lever: each GiB/GPU freed ≈ +63K tokens, but it streams weights per token and is expected to hurt decode. |
 | drop MTP | Frees the draft head + its KV group (the no-MTP placement ran mml 262144) at ~2.7× the decode cost. Not worth it for a personal seat. |
 
 **Resulting production config** (gmu 0.95, mml 131072, seqs 4, ladder ≤ 12, MTP 2, P2P env):
@@ -206,17 +207,21 @@ the fast paths never got the same treatment. It is a plain upstream bug for any 
 speed-validated, quality-pending, on top of the PIECEWISE drift caveat in `GRAPH-CAPTURE-FIX.md`.
 
 ### Toward 8 GPUs
-With 8 cards and EP: ~16 GB of weights per GPU, so `--cpu-offload-gb` (a real per-token PCIe cost
-today) goes away, and KV headroom goes from ~2.8 to ~12 GiB per GPU — roughly a 1M-token pool. Expect
-a meaningful single-stream gain but not 2×; the 8-rank collectives are exactly where the P2P transport
-stops being a tie. Board reality on this box: the MC62-G40 has 7 physical slots, so an 8th card needs
-a riser; TP needs a power of two, so 7 buys nothing over 6. `tools/launch.sh EP=1` is the launcher.
+With 8 cards and EP (TP8 attention + 64 whole experts per rank): the 4-bit expert weights that dominate
+today's 24.5 GiB/GPU halve, so KV headroom goes from ~2.8 to roughly 12 GiB per GPU (estimate) — on the
+order of a 1M-token pool at ~63K tokens/GiB. Expect a meaningful single-stream gain but not 2×; the
+8-rank collectives are exactly where the P2P transport stops being a tie. Board reality on this box: the
+MC62-G40 has 7 physical slots, so an 8th card needs a riser; TP needs a power of two, so 7 buys nothing
+over 6. `tools/launch.sh` (EP on by default) is the launcher. Not yet attempted — 6 cards installed.
 
 ---
 
 ## 6. Open items
-- HumanEval on the EP seat (`run_humaneval_c1.sh` against the same port).
+- Quality on the production EP + PIECEWISE + MTP seat: a full suite (HumanEval, ARC, needle, PlanBench,
+  AutomationBench, …) is running against it as of 2026-09-04; results go in README § Validation.
+  (`run_humaneval_c1.sh PORT=<port>` is the standalone HumanEval harness.)
 - Old-env concurrency sweep, if the batch-level P2P claim is ever to be a measurement.
 - Upstream `moe_wna16.patch`.
-- `--cpu-offload-gb` sweep (14 GiB/GPU would add ~250K tokens of pool — at what decode cost?).
+- `--cpu-offload-gb` as a KV-headroom lever (each GiB/GPU ≈ +63K tokens — at what decode cost?).
 - `NCCL_MIN_NCHANNELS=4` in a real seat.
+- 8 GPUs via EP (§5), once the cards are in.
