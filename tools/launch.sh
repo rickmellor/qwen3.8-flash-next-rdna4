@@ -15,13 +15,26 @@ NAME=${1:-flashnext}; PORT=${2:-8011}; GPUS=${3:-0,1,2,3}
 IMAGE=${IMAGE:-vllm/vllm-openai-rocm:nightly-27a94d1ce4e3fc100c4732439ccec10f8246a804}
 V=/usr/local/lib/python3.12/dist-packages/vllm
 GMU=${GMU:-0.95}; MML=${MML:-131072}; SEQS=${SEQS:-4}; EP=${EP:-1}; MTP=${MTP:-2}
+# Numerics-probe knobs: EAGER=1 -> --enforce-eager (no compilation config at all);
+# CUSTOM_OPS="none,+rms_norm" -> compilation_config.custom_ops; CGMODE=NONE|PIECEWISE -> cudagraph_mode.
+EAGER=${EAGER:-0}; CUSTOM_OPS=${CUSTOM_OPS:-}; CGMODE=${CGMODE:-}
+export CUSTOM_OPS CGMODE
 CC=$(python3 - "$REPO" "${LADDER:-}" <<'PY'
 import json,sys
+import os
 cc=json.load(open(f"{sys.argv[1]}/tools/compilation_config_seqs4.json"))
 if sys.argv[2]: cc["cudagraph_capture_sizes"]=json.loads(sys.argv[2])
+if os.environ.get("CUSTOM_OPS"): cc["custom_ops"]=os.environ["CUSTOM_OPS"].split(",")
+if os.environ.get("CGMODE"): cc["cudagraph_mode"]=os.environ["CGMODE"]
 print(json.dumps(cc))
 PY
 )
+COMPILE=(--compilation-config "$CC")
+if [ "$EAGER" = "1" ]; then
+  # Eager still honours compilation_config.custom_ops (kernel vs torch-native op implementations).
+  COMPILE=(--enforce-eager)
+  [ -n "$CUSTOM_OPS" ] && COMPILE+=(--compilation-config "$(python3 -c 'import json,os;print(json.dumps({"custom_ops":os.environ["CUSTOM_OPS"].split(",")}))')")
+fi
 EXTRA=()
 [ "$EP" = "1" ] && EXTRA+=(--enable-expert-parallel)
 [ "$MTP" != "0" ] && EXTRA+=(--speculative-config "{\"method\":\"mtp\",\"num_speculative_tokens\":$MTP}")
@@ -48,10 +61,10 @@ docker run -d --name "$NAME" --device /dev/kfd --device /dev/dri --group-add vid
   --tensor-parallel-size 4 --gpu-memory-utilization "$GMU" \
   --max-model-len "$MML" --max-num-seqs "$SEQS" --max-num-batched-tokens 8192 \
   --kv-cache-dtype auto --quantization awq_marlin --enable-prefix-caching \
-  --compilation-config "$CC" \
+  "${COMPILE[@]}" \
   "${EXTRA[@]}" \
   --enable-auto-tool-choice --tool-call-parser qwen3_xml --reasoning-parser qwen3 --trust-remote-code
-echo "launched $NAME on :$PORT (gpus $GPUS, gmu $GMU, mml $MML, seqs $SEQS, ep $EP, mtp $MTP)"
+echo "launched $NAME on :$PORT (gpus $GPUS, gmu $GMU, mml $MML, seqs $SEQS, ep $EP, mtp $MTP, eager $EAGER, custom_ops ${CUSTOM_OPS:-default}, cgmode ${CGMODE:-default})"
 echo "  ready when:   curl -sf localhost:$PORT/v1/models"
 echo "  transport:    docker logs $NAME 2>&1 | grep -m1 -oE 'via (P2P/IPC|SHM/direct)'"
 echo "  KV pool:      docker logs $NAME 2>&1 | grep -oE 'GPU KV cache size: .*'"

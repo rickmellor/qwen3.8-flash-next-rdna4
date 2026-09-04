@@ -1,5 +1,5 @@
---- a/vllm/model_executor/layers/quantization/moe_wna16.py
-+++ b/vllm/model_executor/layers/quantization/moe_wna16.py
+--- /home/rick/scratch/flashnext/moe_wna16.orig.py	2026-09-02 22:19:33.000000000 -0700
++++ moe_wna16.py	2026-09-04 14:38:51.400208073 -0700
 @@ -578,9 +578,32 @@
  
              device = get_tp_group().device
@@ -14,7 +14,7 @@
              loaded_weight = loaded_weight.to(device)
              shard_size = layer.intermediate_size_per_partition
  
-+            # EP FIX (2026-09-04, specul8-o-matic): the two qzeros fast paths below
++            # EP FIX (2026-09-04, 4x R9700 box): the two qzeros fast paths below
 +            # index param.data with the GLOBAL expert id. Under expert parallelism a
 +            # rank only holds its local experts (512/EP), so a global id >= local
 +            # count raises "index N is out of bounds for dimension 0". Map global ->

@@ -5,7 +5,8 @@ PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 8002
 URL = f"http://127.0.0.1:{PORT}/v1/chat/completions"
 MODEL = "Qwen3.8-Flash-Next-AWQ"
 from tokenizers import Tokenizer
-tk = Tokenizer.from_file("/mnt/data/models/leoncca/Qwen3.8-Flash-Next-AWQ-g32/tokenizer.json")
+import os
+tk = Tokenizer.from_file(os.path.join(os.environ["MODEL_DIR"], "tokenizer.json"))  # MODEL_DIR = checkpoint dir
 import random
 random.seed(7)
 WORDS = open("/usr/share/dict/words").read().split() if __import__("os").path.exists("/usr/share/dict/words") else [f"w{i}" for i in range(5000)]

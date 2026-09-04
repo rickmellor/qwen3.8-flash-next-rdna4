@@ -588,7 +588,7 @@ class MoeWNA16Method(FusedMoEMethodBase):
             loaded_weight = loaded_weight.to(device)
             shard_size = layer.intermediate_size_per_partition
 
-            # EP FIX (2026-09-04, specul8-o-matic): the two qzeros fast paths below
+            # EP FIX (2026-09-04, 4x R9700 box): the two qzeros fast paths below
             # index param.data with the GLOBAL expert id. Under expert parallelism a
             # rank only holds its local experts (512/EP), so a global id >= local
             # count raises "index N is out of bounds for dimension 0". Map global ->

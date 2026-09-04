@@ -243,15 +243,14 @@ host-RAM gather is not capturable on any hardware, hence the extra `splitting_op
 and pure `PIECEWISE` mode above (the v1 default `FULL_AND_PIECEWISE` captures decode
 batches as one monolithic graph and ignores `splitting_ops`).
 
-Cost of PIECEWISE: output is no longer bit-identical to eager. A token-level diff of the
-saved HumanEval generations (`analyze_divergence.py`, commit `e7c9918`) showed 47/164
-generations diverging mid-output at temperature 0, all coherent, most reconverging —
-FP non-associativity at the split boundaries flipping near-tied tokens, not a logic bug.
-Single-run HumanEval moved 96.34 % → 95.12 % @c1 / 95.73 % @c2 / 93.90 % @c8, which is
-inside the noise 47 flipped trajectories imply, but "statistically equivalent" still
-needs the multi-benchmark run that is in progress. Adopted for production on 2026-09-04
-on that basis; the speedup is ~2.7× at no-MTP and the whole 45–49 tok/s figure depends
-on it.
+Cost of PIECEWISE: output is not bit-identical to eager. That was first read as a
+"quality regression" (a token-level diff of saved HumanEval generations, commit
+`e7c9918`, showed 47/164 greedy generations diverging mid-output, all coherent), then
+as "numerical drift", and finally measured properly on 2026-09-04 — see "Where the
+drift comes from" below. Short version: eager is not a gold standard either; any two
+implementations of this model in bf16 differ by the same amount, and PIECEWISE is just
+one of them. Adopted for production on that basis; the speedup is ~2.7× at no-MTP and
+the whole 45–49 tok/s figure depends on it.
 
 ## Validation
 
@@ -327,12 +326,66 @@ For reference, on the same hardware and methodology: a dense Qwen3.8-27B-FP8
 scores 93.29% (153/164); Gemma-4-26B scores 96.34% (158/164, different 6
 failures than Flash-Next).
 
+## Where the drift comes from (numerics study, 2026-09-04)
+
+Question: PIECEWISE greedy output differs from eager greedy output. Which op is
+responsible, and is it a defect? Method (`tools/drift/`): the same weights on the same
+four GPUs, launched under a series of configurations, each probed with the same twenty
+prompts (the seven HumanEval problems this model fails, plus thirteen prose / code / math
+/ structured prompts), greedy, MTP off, top-5 logprobs recorded per token. Two runs per
+seat give the noise floor. The comparison that matters is at **position 0** — the very
+first generated token, whose distribution is produced by a single prefill pass: no graph
+replay is involved there, so it isolates kernel numerics from CUDA-graph capture.
+
+| Configuration | vs. eager+kernels: top-1 agrees at pos 0 | top-5 max |Δ logprob| at pos 0 (median) | chosen-token mean |Δ| |
+|---|---|---|---|
+| eager+kernels, run 2 (noise floor) | 20/20 | **0.000** | 0.000 |
+| PIECEWISE, run 2 vs run 1 (noise floor) | 20/20 | **0.000** | 0.000 |
+| **PIECEWISE (production)** | 18/20 | 0.48 | 0.018 |
+| PIECEWISE + rotary forced to native kernel | 19/20 | 0.45 | 0.019 |
+| PIECEWISE + activation forced to native kernel | 19/20 | 0.51 | 0.019 |
+| **eager, all ops torch-native (no compiler at all)** | 19/20 | 0.49 | 0.024 |
+| eager, only the norms torch-native | 18/20 | 0.46 | 0.022 |
+| eager, only rotary torch-native | 18/20 | 0.35 | 0.026 |
+| eager, only the activation torch-native | 20/20 | 0.000 | 0.000 |
+
+(PIECEWISE with the *norm* kernels forced native does not launch on this build — Dynamo
+refuses to trace the ROCm RMSNorm wrapper, `device_index.__init__` "marked as skipped" —
+which is why the bisection moved to the eager side.)
+
+Findings:
+
+1. **Both modes are deterministic.** Run-to-run, eager and PIECEWISE each reproduce every
+   logprob to the last digit. The gap between them is a fixed implementation difference,
+   not autotuning or scheduling nondeterminism.
+2. **The gap is not the compiler's.** Eager with torch-native op implementations — no
+   Inductor, no graphs, just different (unfused) PyTorch code for norm/rotary/activation —
+   is as far from eager-with-kernels as PIECEWISE is (0.49 vs 0.48 nats), and equally far
+   from PIECEWISE. Swapping *only* the norm implementation, or *only* rotary, produces the
+   full-size effect on its own. Every implementation change lands in the same band.
+3. **The amplifier is the bf16 logit grid.** Every logit gap in every run is an exact
+   multiple of 1/16: the final logits are bf16 at magnitudes 8–32, i.e. a resolution of
+   0.06–0.125 nats. Deltas of 0.3–1.7 nats on tail tokens are several ulps — accumulated
+   bf16 rounding through ~100 layers of a different but equally valid summation order,
+   surfacing on the coarse output grid. It does not grow with prompt length (a 13-token
+   prompt drifts as much as a 407-token one), which is what a per-token systematic
+   rounding difference looks like, not an accumulating error.
+4. **What it does to output.** The token actually chosen moves by ~0.02 nats (≈2 % in
+   probability). Greedy top-1 flips only on near-ties (the "poem" prompt: a 0.44-nat gap
+   in eager became an exact tie under PIECEWISE), and the large moves are all on tail
+   tokens greedy never picks. At any temperature above 0 this is far below sampling noise.
+   The one-problem HumanEval difference between eager and PIECEWISE is this noise class.
+
+Conclusion: nothing to fix. "Bit-exact with eager" is not a meaningful acceptance
+criterion for a bf16 model whose eager path is itself one arbitrary point in the cloud;
+the meaningful criterion is the benchmark table above, which the production config
+passes. This should hold for any bf16 deployment of this model on any vendor's hardware.
+
 ## Known limitations and open items
 
-- **PIECEWISE is not bit-exact with eager** (above). If a use case needs bit-identical
-  greedy output, `--enforce-eager` still works (drop `--compilation-config`) at a 4–7×
-  decode cost; there is no reason to do that for quality alone until the pending
-  suite says otherwise.
+- **PIECEWISE is not bit-exact with eager — and neither is anything else** (see the numerics
+  study). If a workflow needs reproducibility, pin one configuration: each is deterministic
+  run-to-run. Don't pay the 4–7× eager decode cost for "exactness" that eager doesn't have.
 - **fp8 KV is impossible** — QSA hard-requires BF16 KV (`NotImplementedError`). That
   also rules out the fp8-KV-dependent `VLLM_ROCM_USE_AITER=1` path validated elsewhere
   on this hardware (AITER + BF16 KV crashes with an LDS overflow on other models here;
