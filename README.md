@@ -152,24 +152,44 @@ failures than Flash-Next).
 
 ## Known limitations (not yet fixed)
 
-- **`--enforce-eager` is required — root cause now understood, fix not yet found.**
-  `torch.compile`/Inductor tracing actually succeeds cleanly (QSA is already
-  correctly excluded from it via the same `no_compile_layers` opaque-custom-op
-  pattern used for the PLE gather). The real failure is one phase later, during
-  CUDA/HIP **graph capture**: QSA's Triton attention kernels
-  (`amd/ops/qsa.py`) run autotuning that explores multiple candidate kernel
-  configs, some invalid for gfx1201's WMMA v2 ISA — normally harmless (Triton
-  silently discards failed candidates), but fatal when it happens on a stream
-  that's actively being graph-captured (`hipErrorStreamCaptureUnsupported`).
-  This is why eager mode works fine (autotuning never runs inside a capturing
-  stream) despite hitting the identical kernels.
-  Tried: `--compilation-config '{"cudagraph_mode":"NONE"}'` (disables graph
-  capture, keeps Inductor fusion) — **loads and serves successfully, but is
-  slightly slower than `--enforce-eager`** (4.8–5.7 tok/s vs. 6.7–6.8 tok/s),
-  so not adopted. The real fix is pre-warming QSA's Triton kernels in eager
-  mode *before* graph capture begins, so the autotuning search resolves and
-  caches before any stream starts capturing — not yet implemented. Full
-  investigation: `GRAPH-CAPTURE-FIX.md`.
+- **`--enforce-eager` remains the recommended, validated choice** — full graph
+  capture now *works* (see below) but the fastest working config has an
+  unresolved quality regression, so it is not recommended yet. Root cause of
+  the original crash: `torch.compile`/Inductor tracing succeeds cleanly (QSA
+  is already excluded from it via the same `no_compile_layers` mechanism the
+  PLE gather uses). The real failure was one phase later, during CUDA/HIP
+  **graph capture**: QSA's Triton attention kernels run autotuning that
+  explores candidate configs invalid for gfx1201's WMMA v2 ISA — normally
+  harmless (Triton discards failed candidates), but fatal mid-capture
+  (`hipErrorStreamCaptureUnsupported`). Fixed via a kernel warmup
+  (`qwen4_exp_amd_qsa_warmup.py`, wired in via `cudagraph_utils.py` +
+  `kernel_warmup.py`) that resolves QSA's autotuning in eager mode before
+  capture starts — validated via logs, no longer crashes. This warmup is
+  independently correct and included in the patch set regardless of the
+  point below.
+- **Graph capture, once QSA stopped crashing first, hit a second, structural
+  wall:** the PLE offload's host-RAM copy (`ple_cpu.py`) cannot be recorded
+  into a CUDA/HIP graph — host-synchronizing ops are disallowed during
+  capture on any hardware, not a ROCm quirk. Default `splitting_ops`
+  (`CompilationConfig._attention_ops`) already excludes two other PLE-related
+  ops from capture but not this one — likely a genuine upstream gap, since
+  the op didn't exist before this repo's offload patch. Adding it explicitly
+  (`compilation_config.json`) plus switching to pure `cudagraph_mode:
+  PIECEWISE` (the v1 *default* is `FULL_AND_PIECEWISE`, which captures decode
+  batches as one monolithic FULL graph regardless of `splitting_ops` — pure
+  `PIECEWISE` is required so decode batches split too) **works and is
+  substantially faster: 18.3–18.5 tok/s**, ~2.7x the no-MTP eager baseline.
+  But HumanEval on this config scores **93.90% (154/164), a real ~2.4pp
+  regression** from the 96.34% baseline, not identical output as MTP produced
+  — at temperature=0 this shouldn't happen if the configs were numerically
+  equivalent. Not root-caused; leading suspect is a concurrency-dependent
+  interaction at the forced split boundary (the eval ran at
+  `num_concurrent=8`; the speed probe that looked fine was single-request).
+  **Not adopted pending that investigation** — a real, substantial speedup
+  with an unexplained correctness regression fails this repo's
+  validated-results bar. Full details, exact configs, and the next step
+  (rerun at `num_concurrent=1` to isolate the concurrency hypothesis):
+  `GRAPH-CAPTURE-FIX.md`.
 - **AITER untried** — `VLLM_ROCM_USE_AITER=1` is validated elsewhere on
   this hardware, but historically needs FP8 KV to avoid a separate LDS-
   overflow crash, which conflicts with this architecture's mandatory BF16
