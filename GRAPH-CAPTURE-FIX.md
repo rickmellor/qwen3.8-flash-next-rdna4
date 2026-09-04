@@ -413,3 +413,48 @@ No new commit to the GitHub repo -- nothing more shippable than what commit `e72
 already captured; this session's finding is a *correction* to that commit's "promising
 lead" framing (it's less promising than it looked, not more), which the writeup above
 records for accuracy but doesn't warrant its own repo change.
+
+## minPath output diff (2026-09-03, post-restart): verdict — numerical drift, not a logic bug
+
+Ran entirely offline against the saved eval samples (`humaneval_lmeval/` eager
+vs `humaneval_piecewise_c1/`), zero GPU time. Result is unambiguous:
+
+**47 of 164 generations (28.7%) diverge byte-for-byte between eager and
+PIECEWISE at concurrency=1, temperature 0.** Not 2 — 47. The two extra
+c1 *failures* (minPath, get_max_triples) are just the two unlucky draws out of
+47 divergent trajectories; the other 45 landed on alternate solutions that
+happen to also pass (or were already in the 6-hard failing set).
+
+Signature of every divergence examined:
+- Divergence begins mid-generation at varying depths (19%–99% through the
+  output; median ~68%), never at token 0.
+- Both continuations are coherent, well-formed code/reasoning — no garbage,
+  no repetition, no truncation. In minPath's case, eager picks a BFS-over-
+  neighbors formulation and PIECEWISE picks a value-to-position mapping
+  formulation — both plausible, one happens to be buggy.
+- 31/47 trajectories substantially reconverge after the split (post-divergence
+  similarity > 0.5) — the classic "one near-tied token flipped, then the
+  paths mostly heal" pattern. 16/47 split fully (an early flip changed the
+  chosen algorithm).
+
+**Conclusion: PIECEWISE introduces small numerical differences (FP
+non-associativity at the graph-split boundaries) that occasionally flip
+near-tied token choices. It is NOT a logic/state bug in the split mechanism —
+there is no evidence of corruption, only of a numerically *different but
+equally valid* computation.** This also reframes the concurrency data: higher
+concurrency likely just perturbs numerics further (different batch shapes /
+reduction orders), explaining the non-nesting failure sets — every config is
+sampling a slightly different point in the drift space, and which of the 47
+divergent trajectories happen to fail is essentially a coin flip per config.
+
+**Practical implication:** the 2.7x PIECEWISE speedup is not hiding a
+correctness bug — it's trading bit-exactness for speed the way any kernel-
+fusion change does. The ~1pp score movement is within the noise band that
+47 flipped trajectories implies (each divergence is a fresh Bernoulli draw on
+"does the alternate solution also pass"). A fair characterization is
+"statistically equivalent quality, not bit-identical output" — but proving
+that properly needs a multi-seed / multi-benchmark comparison rather than
+single HumanEval runs, since a single run can land 1–2pp either side.
+
+Analysis script: `analyze_divergence.py` (works on any pair of lm-eval
+samples files).
