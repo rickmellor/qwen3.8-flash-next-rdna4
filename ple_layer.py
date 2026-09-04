@@ -661,6 +661,67 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
         if max_len <= 0:
             return output
 
+        # Padded packing costs num_prefills * max_len per copy, and the packed path below
+        # materialises ~5 such copies (packed, its transpose, history, conv output and its
+        # transpose). The startup memory profile sizes its batch as max_num_seqs
+        # equal-length chunks (no padding), so a real batch of one long chunk plus a few
+        # short prompts can need several times the profiled activation peak — on a seat
+        # whose gpu_memory_utilization leaves no slack that is a hard OOM in this very
+        # transpose (Flash-Next 4xR9700, gmu 0.95, 4 concurrent ~16K prompts, 2026-09-04).
+        # Bound the transient: when padding would exceed ~25% of the real tokens, run the
+        # requests one at a time — each then costs at most a single full-width chunk,
+        # which the profile did cover. Same math, same state write-back, no padding.
+        if num_prefills > 1 and num_prefills * max_len > num_prefill_tokens + num_prefill_tokens // 4:
+            return self._short_conv_dilated_prefill_per_request(
+                x_p, output, lengths, state_indices_tensor_p, has_initial_states_p,
+                conv_state, conv_weights,
+            )
+        return self._short_conv_dilated_prefill_core(
+            x_p, output, q_starts, lengths, max_len, num_prefills, num_prefill_tokens,
+            state_indices_tensor_p, has_initial_states_p, conv_state, conv_weights,
+        )
+
+    def _short_conv_dilated_prefill_per_request(
+        self,
+        x_p: torch.Tensor,
+        output: torch.Tensor,
+        lengths: torch.Tensor,
+        state_indices_tensor_p: torch.Tensor,
+        has_initial_states_p: torch.Tensor,
+        conv_state: torch.Tensor,
+        conv_weights: torch.Tensor,
+    ) -> torch.Tensor:
+        """Unpadded fallback for mixed-length prefill batches: one packed call per
+        request. Costs one small device-to-host sync for the lengths; this path is
+        eager-only (prefill is never CUDA-graph captured), so that is safe."""
+        lens = lengths.tolist()
+        start = 0
+        for i, n in enumerate(lens):
+            if n > 0:
+                q_starts_i = torch.tensor([0, n], device=x_p.device, dtype=torch.int64)
+                self._short_conv_dilated_prefill_core(
+                    x_p[start : start + n], output[start : start + n], q_starts_i,
+                    lengths[i : i + 1], n, 1, n,
+                    state_indices_tensor_p[i : i + 1], has_initial_states_p[i : i + 1],
+                    conv_state, conv_weights,
+                )
+            start += n
+        return output
+
+    def _short_conv_dilated_prefill_core(
+        self,
+        x_p: torch.Tensor,
+        output: torch.Tensor,
+        q_starts: torch.Tensor,
+        lengths: torch.Tensor,
+        max_len: int,
+        num_prefills: int,
+        num_prefill_tokens: int,
+        state_indices_tensor_p: torch.Tensor,
+        has_initial_states_p: torch.Tensor,
+        conv_state: torch.Tensor,
+        conv_weights: torch.Tensor,
+    ) -> torch.Tensor:
         hidden_size = x_p.shape[1]
         positions = torch.arange(
             num_prefill_tokens, device=x_p.device, dtype=torch.int64
