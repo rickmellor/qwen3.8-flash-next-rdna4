@@ -1,6 +1,6 @@
 # Running Qwen3.8-Flash-Next (AWQ) on AMD RDNA4 / vLLM-ROCm
 
-Three small patches to vLLM that get `leoncca/Qwen3.8-Flash-Next-AWQ-g32` — an
+Four small patches to vLLM that get `leoncca/Qwen3.8-Flash-Next-AWQ-g32` — an
 AWQ-quantized version of Alibaba's Qwen3.8-Flash-Next (a preview of the Qwen4
 architecture: 125B MoE + a 51GB sparse n-gram embedding table, ~6B parameters
 active per token) — loading and serving on consumer/workstation AMD GPUs.
@@ -12,14 +12,15 @@ path that hadn't been exercised together before.
 
 ## Environment
 
-- Hardware: 4× AMD Radeon AI PRO R9700 (RDNA4, gfx1201, 32 GB each), TP4
+- Hardware: 4× AMD Radeon AI PRO R9700 (RDNA4, gfx1201, 32 GB each), TP4 — on a 6-card MC62-G40 box;
+  BIOS ACS disabled and the P2P env (`HSA_ENABLE_IPC_MODE_LEGACY=0`), see `TUNING.md` §1
 - vLLM: `vllm/vllm-openai-rocm:nightly-27a94d1ce4e3fc100c4732439ccec10f8246a804`
   (the Sept 2 2026 nightly — **required**; mainline v0.28.0 predates
   `qwen4_exp` architecture support entirely)
 - Checkpoint: [`leoncca/Qwen3.8-Flash-Next-AWQ-g32`](https://huggingface.co/leoncca/Qwen3.8-Flash-Next-AWQ-g32)
   (expert-only AWQ W4A16, group size 32; 129 GB on disk)
 
-## The three problems, and the fixes
+## The four problems, and the fixes
 
 ### 1. PLE embedding table doesn't fit in VRAM (`ple_cpu.py`, new file)
 
@@ -112,6 +113,11 @@ Why you want EP on this model: TP8 is impossible for the AWQ-g32 checkpoint (the
 8 GPUs — and it is also faster on 4 (see Validation).
 
 ## Applying the patches
+
+`tools/launch.sh` wraps the command below (P2P env, all four patches, knobs via env, `EP=1`
+for expert parallelism). `TUNING.md` walks through how every setting in it was arrived at —
+GPU P2P root cause, memory budget, concurrency, expert parallelism — with the probes in `tools/`.
+
 
 No image rebuild needed — bind-mount the three files over the installed
 copies:
