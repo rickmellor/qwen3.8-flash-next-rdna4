@@ -1,0 +1,51 @@
+--- a/vllm/model_executor/layers/quantization/moe_wna16.py
++++ b/vllm/model_executor/layers/quantization/moe_wna16.py
+@@ -578,9 +578,32 @@
+ 
+             device = get_tp_group().device
+             tp_rank = get_tensor_model_parallel_rank()
++            # EP FIX (2): the qzeros branches slice the checkpoint tensor by TP rank
++            # (view(..., tp_size, ...)[tp_rank]). Under expert parallelism the MoE
++            # layer's own parallel config has tp_size=1 / tp_rank=0 (experts are not
++            # split within a rank), while get_tensor_model_parallel_rank() still
++            # returns the global rank -> "index r is out of bounds for dimension 1
++            # with size 1". Use the MoE config's rank, which is what the view uses.
++            tp_rank = getattr(layer.moe_config, "tp_rank", tp_rank)
+             loaded_weight = loaded_weight.to(device)
+             shard_size = layer.intermediate_size_per_partition
+ 
++            # EP FIX (2026-09-04, specul8-o-matic): the two qzeros fast paths below
++            # index param.data with the GLOBAL expert id. Under expert parallelism a
++            # rank only holds its local experts (512/EP), so a global id >= local
++            # count raises "index N is out of bounds for dimension 0". Map global ->
++            # local exactly as FusedMoE.weight_loader does, and skip experts this
++            # rank does not own. The delegate weight_loader() call at the bottom maps
++            # ids itself, so it keeps receiving the global id.
++            local_expert_id = expert_id
++            _map = getattr(layer, "_map_global_expert_id_to_local_expert_id", None)
++            if _map is not None:
++                local_expert_id = _map(expert_id)
++                if local_expert_id == -1 and (
++                    "w13_qzeros" in weight_name or "w2_qzeros" in weight_name
++                ):
++                    return False if return_success else None
++
+             # convert gptq and awq weight to a standard format
+             # awq_marlin uses the same weight format as awq
+             if layer.quant_config.linear_quant_method in ("awq", "awq_marlin"):
+@@ -620,12 +643,12 @@
+                     layer.moe_config.tp_size, -1, loaded_weight.size(1)
+                 )[tp_rank]
+                 if shard_id == "w1":
+-                    param.data[expert_id, : shard_size // 2] = tensor
++                    param.data[local_expert_id, : shard_size // 2] = tensor
+                 else:
+-                    param.data[expert_id, shard_size // 2 :] = tensor
++                    param.data[local_expert_id, shard_size // 2 :] = tensor
+                 return True if return_success else None
+             elif "w2_qzeros" in weight_name:
+-                param.data[expert_id] = loaded_weight.view(
++                param.data[local_expert_id] = loaded_weight.view(
+                     loaded_weight.size(0), layer.moe_config.tp_size, -1
+                 )[:, tp_rank]
+                 return True if return_success else None

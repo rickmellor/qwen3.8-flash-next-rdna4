@@ -82,6 +82,35 @@ bug that only a downstream shape/dtype mismatch happened to surface as a
 crash. Worth a second read if you're adapting this patch to a different
 checkpoint or architecture — "it loads" is not the same as "it's correct."
 
+### 4. Expert parallelism crashes in the WNA16 MoE weight loader (`moe_wna16.py`)
+
+`IndexError: index 128 is out of bounds for dimension 0 with size 128` (rank 0) and
+`IndexError: index 1 is out of bounds for dimension 1 with size 1` (ranks ≥ 1) when
+launching with `--enable-expert-parallel`.
+
+Because this checkpoint takes the generic WNA16 path (problem 2), its expert
+weights go through `moe_wna16_weight_loader`. That loader has two fast paths for
+`w13_qzeros` / `w2_qzeros` which (a) write `param.data[expert_id]` using the
+**global** expert id, and (b) slice the checkpoint tensor by
+`get_tensor_model_parallel_rank()`. Both assumptions only hold without EP. Under
+expert parallelism each rank owns `num_experts / ep_size` whole experts (here
+512/4 = 128) and the MoE layer's own parallel config has `tp_size = 1`,
+`tp_rank = 0` — experts are not split within a rank — so a global id ≥ 128 or a
+TP rank ≥ 1 walks off the end of the local tensor. The delegate loader those
+branches fall through to already maps global → local; the fast paths simply
+never got the same treatment.
+
+Fix (`moe_wna16.patch`, ~20 lines): map the expert id with
+`layer._map_global_expert_id_to_local_expert_id()` and skip experts this rank
+does not own, and take the slicing rank from `layer.moe_config.tp_rank`. This is
+a plain vLLM bug (any WNA16-quantized MoE + EP), independent of the other three
+patches.
+
+Why you want EP on this model: TP8 is impossible for the AWQ-g32 checkpoint (the
+640-wide experts shard to 80 columns per rank on the down-projection and
+80 % 32 ≠ 0), so expert parallelism is the only way to spread this model across
+8 GPUs — and it is also faster on 4 (see Validation).
+
 ## Applying the patches
 
 No image rebuild needed — bind-mount the three files over the installed
@@ -93,11 +122,12 @@ docker run -d --name flashnext \
   --ipc host --shm-size 16g \
   -e HIP_VISIBLE_DEVICES=0,1,2,3 \
   -e VLLM_QWEN4EXP_PLE_CPU_OFFLOAD=1 \
-  -e NCCL_P2P_DISABLE=1 -e RCCL_NET=Socket -e NCCL_PROTO=Simple \
+  -e HSA_ENABLE_IPC_MODE_LEGACY=0 -e NCCL_PROTO=Simple \
   -e HIP_FORCE_DEV_KERNARG=1 -e SAFETENSORS_FAST_GPU=1 \
   -v $PWD/ple_layer.py:/usr/local/lib/python3.12/dist-packages/vllm/models/qwen4_exp/amd/ple_layer.py \
   -v $PWD/ple_cpu.py:/usr/local/lib/python3.12/dist-packages/vllm/models/qwen4_exp/common/ple_cpu.py \
   -v $PWD/routed_experts.py:/usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/fused_moe/routed_experts.py \
+  -v $PWD/moe_wna16.py:/usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/quantization/moe_wna16.py \
   -v /path/to/Qwen3.8-Flash-Next-AWQ-g32:/model \
   -p 8009:8000 \
   vllm/vllm-openai-rocm:nightly-27a94d1ce4e3fc100c4732439ccec10f8246a804 \
@@ -110,6 +140,21 @@ docker run -d --name flashnext \
 ```
 
 Notes on the flags:
+- `HSA_ENABLE_IPC_MODE_LEGACY=0` replaces the `NCCL_P2P_DISABLE=1 RCCL_NET=Socket`
+  pair this README previously carried. The "gfx1201 RCCL bug" (`hipIpcGetMemHandle:
+  invalid argument` on every vLLM-ROCm image ≥ 0.21) turned out to be that env var,
+  baked into those images, forcing the legacy KFD IPC path which gfx12 rejects. With
+  it off RCCL initialises `via P2P/IPC` (all-reduce 19.7 vs 11.6 GB/s busbw on 4×R9700;
+  BIOS ACS should be disabled for real P2P DMA). Keep `NCCL_PROTO=Simple` — that one is
+  a separate RCCL LL-protocol deadlock on gfx12.
+- Add `--enable-expert-parallel` (with `moe_wna16.py` mounted) for the EP variant —
+  +8–10 % decode on 4 GPUs and the only route to 8.
+- Production knobs that survived testing: `--gpu-memory-utilization 0.95` (0.97 loads
+  but OOMs the engine as soon as prefills batch), `--max-num-seqs 4` (2 trips a
+  torch.compile `ConstraintViolation` on `query_start_loc`), and an explicit
+  `cudagraph_capture_sizes` ladder (`[1,2,3,4,6,8,12]` for seqs 4 — the default ladder
+  at `--max-num-seqs 32` balloons to 192 sizes and leaves 0 GiB for KV). With those,
+  `--max-model-len 131072` fits at 2.08× concurrency (272K-token KV pool).
 - `--kv-cache-dtype auto` (i.e. BF16) is **mandatory**, not a choice — the
   architecture's attention mechanism (QSA) raises `NotImplementedError` on
   FP8 KV. This is unrelated to any patch here.
@@ -137,6 +182,18 @@ live `/metrics` — not vendor claims.
 | Spec-decode acceptance | — | 61.8% (446/722 draft tokens) |
 | Needle-in-haystack | clean @ 123.5K tokens | — |
 | VRAM per rank | ~28 GiB | ~28 GiB |
+
+PIECEWISE graphs + MTP, P2P env, gmu 0.95 / mml 131072 / seqs 4 (2026-09-04, n=8
+per cell, 512-token generations, prefix-cached, otherwise idle box):
+
+| | 55K-token context | 120K-token context |
+|---|---|---|
+| TP4 | 45.1 ± 2.0 tok/s | 44.8 ± 3.2 tok/s |
+| TP4 + expert parallel | **49.4 ± 3.2 tok/s** | **48.3 ± 3.3 tok/s** |
+
+Decode is flat with depth. HumanEval has **not** yet been re-run on the EP
+variant (arithmetic sanity only) — treat it as speed-validated, quality-pending,
+on top of the PIECEWISE caveat below.
 
 The identical HumanEval score and identical six failed problems (`find_zero`,
 `decode_cyclic`, `decode_shift`, `rounded_avg`, `fix_spaces`,
