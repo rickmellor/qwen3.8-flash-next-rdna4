@@ -353,3 +353,63 @@ reference). Corrected: `qwen4_exp_amd_qsa_warmup.py` now confirmed mounted at
 `vllm/model_executor/warmup/qwen4_exp_amd_qsa_warmup.py` (prior session's writeup didn't
 specify the exact target path; this was a real bug the first launch attempt this session
 hit and fixed).
+
+## PIECEWISE concurrency isolation 2026-09-03/04: real, but not purely a race
+
+Three-point HumanEval comparison, all at 0 temperature, PIECEWISE + QSA-warmup config
+(18.3-18.5 tok/s, ~2.7x eager):
+
+| Concurrency | Score | Fails | Extra failures beyond the 6-baseline-hard set |
+|---|---|---|---|
+| eager baseline (any) | 96.34% (158/164) | 6 | — (find_zero, decode_cyclic, decode_shift, rounded_avg, fix_spaces, order_by_points) |
+| PIECEWISE @ 1 | 95.12% (156/164) | 8 | minPath, get_max_triples |
+| PIECEWISE @ 2 | 95.73% (157/164) | 7 | minPath |
+| PIECEWISE @ 8 | 93.90% (154/164) | 10 | is_simple_power, sort_array, minPath, is_nested |
+
+**Not a clean concurrency gradient.** The extra-failure *count* roughly tracks concurrency
+(2 -> 1 -> 4), but the extra-failure *set* does not nest or overlap cleanly: c1's unique
+extra (get_max_triples) doesn't appear at c2 or c8; c8's three unique extras
+(is_simple_power, sort_array, is_nested) don't appear at c1 or c2. Only one problem --
+**minPath** -- fails at every concurrency level tested, including fully serialized c1.
+
+**This changes the verdict.** A problem failing at concurrency=1 rules out a pure
+concurrency-race explanation for the whole regression -- at minimum, minPath reflects a
+real, reproducible-enough correctness gap in PIECEWISE's execution path itself (most
+likely floating-point non-associativity from the different kernel/graph-split boundary,
+consistent with it being sensitive to something inherent to the piecewise split rather
+than only to request interleaving). The other extra failures (get_max_triples,
+is_simple_power, sort_array, is_nested) look like a second, genuinely concurrency-linked
+effect -- more failures pile up as more requests are in flight -- but not a strictly
+monotonic or deterministic one; they're closer to sporadic/probabilistic than to a fixed
+set of "fragile under load" problems.
+
+**Honest final verdict: not recommended at any concurrency without further root-causing.**
+The temptation is "safe for single-stream, unsafe for concurrent serving" -- that would be
+the story if minPath had passed at c1. It didn't. A ~0.6-1.2 percentage point regression
+persists even fully serialized, which means PIECEWISE mode has an unresolved correctness
+issue independent of concurrency, on top of a separate, less-understood concurrency-linked
+one. Two unexplained failure modes stacked is a real asterisk, not "basically fine." The
+2.7x speed number is real and worth returning to once someone traces why minPath
+specifically diverges (comparing its generated output token-by-token against the eager
+baseline's would be the concrete next step -- not attempted this session), but shipping it
+as a recommended config today would mean quietly trading ~1-4% correctness for speed
+without understanding why, which fails this repo's validated-results standard the same way
+the original concurrency=8 result did.
+
+**MTP + PIECEWISE combination: not attempted**, per standing instruction not to compound
+onto an unvalidated base -- correct call, since the base itself just got less validated,
+not more, from this session's data.
+
+**Status:** `--enforce-eager` remains the only recommended launch config. QSA warmup fix
+stands on its own merits regardless (already pushed, commit `e724065`). PIECEWISE lead
+recorded here as a real, partially-characterized, NOT-adopted option for whoever continues
+this -- the concrete next diagnostic step is a token-level diff on minPath's output between
+eager and PIECEWISE at concurrency=1, to determine whether it's small numerical drift
+(likely fixable/acceptable) or a larger logic divergence (likely a real bug).
+
+Files added this session: `run_humaneval_c1.sh`, `run_humaneval_c2.sh` (reference,
+concurrency isolation harness). Samples: `humaneval_piecewise_c1/`, `humaneval_piecewise_c2/`.
+No new commit to the GitHub repo -- nothing more shippable than what commit `e724065`
+already captured; this session's finding is a *correction* to that commit's "promising
+lead" framing (it's less promising than it looked, not more), which the writeup above
+records for accuracy but doesn't warrant its own repo change.

@@ -179,16 +179,23 @@ failures than Flash-Next).
   batches as one monolithic FULL graph regardless of `splitting_ops` — pure
   `PIECEWISE` is required so decode batches split too) **works and is
   substantially faster: 18.3–18.5 tok/s**, ~2.7x the no-MTP eager baseline.
-  But HumanEval on this config scores **93.90% (154/164), a real ~2.4pp
-  regression** from the 96.34% baseline, not identical output as MTP produced
-  — at temperature=0 this shouldn't happen if the configs were numerically
-  equivalent. Not root-caused; leading suspect is a concurrency-dependent
-  interaction at the forced split boundary (the eval ran at
-  `num_concurrent=8`; the speed probe that looked fine was single-request).
-  **Not adopted pending that investigation** — a real, substantial speedup
-  with an unexplained correctness regression fails this repo's
-  validated-results bar. Full details, exact configs, and the next step
-  (rerun at `num_concurrent=1` to isolate the concurrency hypothesis):
+  But HumanEval on this config regresses, and a three-point concurrency
+  sweep has since ruled out the obvious explanation: **96.34% (158/164)
+  eager baseline vs 95.12% @ c1, 95.73% @ c2, 93.90% @ c8.** Concurrency is
+  clearly *part* of it — the extra-failure count tracks it — but the failing
+  *sets* don't nest, and one problem (`minPath`) fails at every level tested
+  **including fully serialized c1**. A regression that survives zero
+  concurrent requests is not a race: PIECEWISE has an unresolved correctness
+  gap in its own execution path (most likely floating-point drift at the
+  graph-split boundary), with a second, sporadic concurrency-linked effect
+  stacked on top. **Not adopted, and not recommended at any concurrency** —
+  including single-stream, which is where it would otherwise be tempting to
+  call it safe. Trading ~1-4% correctness for 2.7x speed without knowing why
+  fails this repo's validated-results bar. The speedup is real and worth
+  returning to; the concrete next step is a token-level diff of `minPath`'s
+  output between eager and PIECEWISE at c1, to separate small numerical
+  drift from an actual logic divergence. Full data, exact configs, and the
+  c1/c2 harness (`run_humaneval_c1.sh`, `run_humaneval_c2.sh`):
   `GRAPH-CAPTURE-FIX.md`.
 - **AITER untried** — `VLLM_ROCM_USE_AITER=1` is validated elsewhere on
   this hardware, but historically needs FP8 KV to avoid a separate LDS-
